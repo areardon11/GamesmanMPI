@@ -2,11 +2,13 @@
 # SOLVER PORTION
 #################################################
 
+DEBUG = True
+
 from mpi4py import MPI
 import hashlib
 import sys
 import inspect
-from Queue import PriorityQueue
+from queue import PriorityQueue
 
 # Import game definition from file specified in command line
 game_module = __import__(sys.argv[1].replace('.py', ''))
@@ -78,11 +80,13 @@ class Job:
     DISTRIBUTE        = "distribute"
     CHECK_FOR_UPDATES = "check_for_updates"
     SEND_BACK         = "send_back"
+    FINISHED          = "finished"
     _priority_table = {
-            LOOK_UP           : 0,
-            SEND_BACK         : 1,
-            DISTRIBUTE        : 2,
-            CHECK_FOR_UPDATES : 3
+            FINISHED          : 0,
+            LOOK_UP           : 1,
+            SEND_BACK         : 2,
+            DISTRIBUTE        : 3,
+            CHECK_FOR_UPDATES : 4
     }
 
     # Keep a special variable for the initial job!
@@ -121,6 +125,7 @@ class Process:
         checking for recieving.
         """
         _dispatch_table = {
+                Job.FINISHED          : self.finished,
                 Job.LOOK_UP           : self.lookup,
                 Job.DISTRIBUTE        : self.distribute,
                 Job.SEND_BACK         : self.send_back,
@@ -138,7 +143,11 @@ class Process:
             if self.work.qsize() == 0:
                 # Either we are done...
                 if self.rank == Process.ROOT:
-                    Process.IS_FINISHED = comm.bcast(True)
+                    if DEBUG:
+                        print("Finished")
+                    fin = Job(Job.FINISHED)
+                    for r in range(0, size):
+                        comm.isend(fin,  dest = r)
                 # ... or we must wait.
                 else:
                     self.add_job(Job(Job.CHECK_FOR_UPDATES))
@@ -179,18 +188,30 @@ class Process:
         """
         self.work.put(job)
 
+    def finished(self, job):
+        """
+        Occurs when the root node has detected that the game has been solved
+        """
+        IS_FINISHED = True
+
     def lookup(self, job):
         """
         Takes a GameState object and determines if it is in the
         resolved list. Returns the result if this is the case, None
         otherwise.
         """
+        if DEBUG:
+            print("Machine " + str(rank) + " looking up " + str(job.game_state.pos))
         try:
             res = self.resolved[job.game_state.pos]
+            if DEBUG:
+                print(str(job.game_state.pos) + " has been resolved")
             return Job(Job.SEND_BACK, res, self.rank, job.parent, job.job_id)
         except KeyError: # Not in dictionary.
             # Try to see if it is_primitive:
             if job.game_state.is_primitive():
+                if DEBUG:
+                    print(str(job.game_state.pos) + " is primitive")
                 self.resolved[job.game_state.pos] = job.game_state.state
                 return Job(Job.SEND_BACK, job.game_state.state, self.rank, job.job_id)
             self._distributed_id += 1
@@ -207,6 +228,9 @@ class Process:
         # some point.
         for child in children:
             job = Job(Job.LOOK_UP, child, self.rank, self._distributed_id)
+            if DEBUG:
+                print(str(rank) + " found child " + str(job.game_state.pos) + ", sending to " + str(child.get_hash()))
+
             self.sent.append(comm.isend(job,  dest = child.get_hash()))
 
     def check_for_updates(self, job):
@@ -217,6 +241,7 @@ class Process:
         Returns None if there is nothing to be recieved.
         """
         # Probe for any sources
+
         if comm.iprobe(source=MPI.ANY_SOURCE):
             # If there are sources recieve them.
             self.received.append(comm.recv(source=MPI.ANY_SOURCE))
@@ -230,6 +255,8 @@ class Process:
         Send the job back to the node who asked for the computation
         to be done.
         """
+        if DEBUG:
+            print(str(rank) + " is sending back " + str(job.game_state.pos))
         comm.send(job, dest=job.parent)
 
     def _res_red(self, res1, res2):
